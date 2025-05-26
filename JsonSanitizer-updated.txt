@@ -895,6 +895,151 @@ public final class JsonSanitizer {
         return true;
     }
 
+    /**
+     * Ensures that the given run of characters is a valid JSON number.
+     * It normalizes JS number constructs such as hex literals, octal literals,
+     * leading plus signs, empty integer parts, empty fractions, and exponents.
+     *
+     * @param start inclusive start index in jsonish
+     * @param end exclusive end index in jsonish
+     */
+    private void normalizeNumber(int start, int end) {
+        int pos = start;
+    
+        // Handle optional sign
+        if (pos < end) {
+            switch (jsonish.charAt(pos)) {
+                case '+':
+                    // JSON disallows '+', so remove
+                    elide(pos, pos + 1);
+                    ++pos;
+                    break;
+                case '-':
+                    ++pos;
+                    break;
+                default:
+                    break;
+            }
+        }
+    
+        // Parse integer part
+        int intEnd = endOfDigitRun(pos, end);
+        if (pos == intEnd) {
+            // Empty integer part not allowed in JSON (e.g., '.5' → '0.5')
+            insert(pos, '0');
+        } else if ('0' == jsonish.charAt(pos)) {
+            // Handle hex (0x...) and octal (0...) literals conversion to decimal
+            boolean reencoded = false;
+            int maxDigVal = 0;
+            int probableBase = 10;
+            int firstDigitIndex = -1;
+    
+            if (intEnd - pos == 1 && intEnd < end && 'x' == (jsonish.charAt(intEnd) | 32)) {
+                // Hexadecimal literal
+                probableBase = 16;
+                firstDigitIndex = intEnd + 1;
+                intEnd++;
+                for (; intEnd < end; ++intEnd) {
+                    char ch = jsonish.charAt(intEnd);
+                    int digVal;
+                    if ('0' <= ch && ch <= '9') {
+                        digVal = ch - '0';
+                    } else {
+                        char lch = (char)(ch | 32);
+                        if ('a' <= lch && lch <= 'f') {
+                            digVal = lch - 'a' + 10;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (digVal > maxDigVal) maxDigVal = digVal;
+                }
+                reencoded = true;
+            } else if (intEnd - pos > 1) {
+                // Octal literal (0...)
+                probableBase = 8;
+                firstDigitIndex = pos;
+                for (int i = pos; i < intEnd; ++i) {
+                    char ch = jsonish.charAt(i);
+                    int digVal = ch - '0';
+                    if (digVal < 0) break;
+                    if (digVal > maxDigVal) maxDigVal = digVal;
+                }
+                reencoded = true;
+            }
+    
+            if (reencoded) {
+                elide(pos, intEnd);
+                String digits = jsonish.substring(firstDigitIndex, intEnd);
+    
+                int nDigits = digits.length();
+                int base = probableBase > maxDigVal ? probableBase : maxDigVal > 10 ? 16 : 10;
+                if (nDigits == 0) {
+                    sanitizedJson.append('0');
+                } else if (base == 10 || DIGITS_BY_BASE_THAT_FIT_IN_63B[base] >= nDigits) {
+                    long value = Long.parseLong(digits, base);
+                    sanitizedJson.append(value);
+                } else {
+                    BigInteger value = new BigInteger(digits, base);
+                    sanitizedJson.append(value);
+                }
+            }
+        }
+    
+        pos = intEnd;
+    
+        // Fraction part starting with '.'
+        if (pos < end && jsonish.charAt(pos) == '.') {
+            ++pos;
+            int fractionEnd = endOfDigitRun(pos, end);
+            if (fractionEnd == pos) {
+                // Empty fraction after '.' is invalid - insert '0' (e.g., '1.' → '1.0')
+                insert(pos, '0');
+            }
+            pos = fractionEnd;
+        }
+    
+        // Exponent part starting with 'e' or 'E'
+        if (pos < end && (jsonish.charAt(pos) | 32) == 'e') {
+            ++pos;
+            if (pos < end) {
+                switch (jsonish.charAt(pos)) {
+                    // Explicit plus '+' or minus '-' for exponent sign
+                    case '+', '-':
+                        ++pos;
+                        break;
+                    default:
+                        break;
+                }
+            }
+            int expEnd = endOfDigitRun(pos, end);
+            if (expEnd == pos) {
+                // Empty exponent digits not allowed - insert '0'
+                insert(pos, '0');
+            }
+            pos = expEnd;
+        }
+    
+        if (pos != end) {
+            // Remove invalid trailing characters
+            elide(pos, end);
+        }
+    }
+    
+    /**
+     * Finds the end index (exclusive) of a digit run [0-9] starting at 'start'.
+     * Stops at first non-digit or limit.
+     */
+    private int endOfDigitRun(int start, int limit) {
+        int i = start;
+        while (i < limit) {
+            if (!Character.isDigit(jsonish.charAt(i))) {
+                break;
+            }
+            i++;
+        }
+        return i;
+    }
 
 }
 
