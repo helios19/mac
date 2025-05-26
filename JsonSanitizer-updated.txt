@@ -1,0 +1,774 @@
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.math.BigInteger;
+
+/**
+ * Given JSON-like content, converts it to valid JSON.
+ * This can be attached at either end of a data-pipeline to help satisfy
+ * Postel's principle:
+ * <blockquote>
+ * be conservative in what you do, be liberal in what you accept from others
+ * </blockquote>
+ * <p>
+ * Applied to JSON-like content from others, it will produce well-formed JSON
+ * that should satisfy any parser you use.
+ * <p>
+ * Applied to your output before you send, it will coerce minor mistakes in
+ * encoding and make it easier to embed your JSON in HTML and XML.
+ *
+ * <h2>Input</h2>
+ * The sanitizer takes JSON like content, and interprets it as JS eval would.
+ * Specifically, it deals with these non-standard constructs.
+ * <ul>
+ * <li>{@code '...'} Single quoted strings are converted to JSON strings.
+ * <li>{@code \xAB} Hex escapes are converted to JSON unicode escapes.
+ * <li>{@code \012} Octal escapes are converted to JSON unicode escapes.
+ * <li>{@code 0xAB} Hex integer literals are converted to JSON decimal numbers.
+ * <li>{@code 012} Octal integer literals are converted to JSON decimal numbers.
+ * <li>{@code +.5} Decimal numbers are coerced to JSON's stricter format.
+ * <li>{@code [0,,2]} Elisions in arrays are filled with {@code null}.
+ * <li>{@code [1,2,3,]} Trailing commas are removed.
+ * <li><code>{foo:"bar"}</code> Unquoted property names are quoted.
+ * <li><code>//comments</code> JS style line and block comments are removed.
+ * <li><code>(...)</code> Grouping parentheses are removed.
+ * </ul>
+ *
+ * The sanitizer fixes missing punctuation, end quotes, and mismatched or
+ * missing close brackets. If an input contains only white-space then the valid
+ * JSON string {@code null} is substituted.
+ *
+ * <h2>Output</h2>
+ * The output is well-formed JSON as defined by
+ * <a href="http://www.ietf.org/rfc/rfc4627.txt">RFC 4627</a>.
+ * The output satisfies three additional properties:
+ * <ol>
+ * <li>The output will not contain the substring (case-insensitively)
+ *   {@code "</script"} so can be embedded inside an HTML script element without
+ *   further encoding.
+ * <li>The output will not contain the substring {@code "]]>"} so can be
+ *   embedded inside an XML CDATA section without further encoding.</li>
+ * <li>The output is a valid Javascript expression, so can be parsed by
+ *   Javascript's <code>eval</code> builtin (after being wrapped in parentheses)
+ *   or by <code>JSON.parse</code>.
+ *   Specifically, the output will not contain any string literals with embedded
+ *   JS newlines (U+2028 Paragraph separator or U+2029 Line separator).
+ * <li>The output contains only valid Unicode scalar values
+ *   (no isolated UTF-16 surrogates) that are
+ *   <a href="http://www.w3.org/TR/xml/#charsets">allowed in XML</a> unescaped.
+ * </ol>
+ *
+ * <h2>Security</h2>
+ * Since the output is well-formed JSON, passing it to <code>eval</code> will
+ * have no side-effects and no free variables, so is neither a code-injection
+ * vector, nor a vector for exfiltration of secrets.
+ *
+ * <p>This library only ensures that the JSON string &rarr; Javascript object
+ * phase has no side effects and resolves no free variables, and cannot control
+ * how other client side code later interprets the resulting Javascript object.
+ * So if client-side code takes a part of the parsed data that is controlled by
+ * an attacker and passes it back through a powerful interpreter like
+ * {@code eval} or {@code innerHTML} then that client-side code might suffer
+ * unintended side-effects.
+ *
+ * <h2>Efficiency</h2>
+ * The sanitize method will return the input string without allocating a new
+ * buffer when the input is already valid JSON that satisfies the properties
+ * above.  Thus, if used on input that is usually well formed, it has minimal
+ * memory overhead.
+ * <p>The sanitize method takes O(n) time where n is the length in UTF-16
+ * code-units.
+ */
+public final class JsonSanitizer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(JsonSanitizer.class);
+
+    /** The default for the maximumNestingDepth constructor parameter. */
+    public static final int DEFAULT_NESTING_DEPTH = 64;
+
+    /** The maximum value for the maximumNestingDepth constructor parameter. */
+    public static final int MAXIMUM_NESTING_DEPTH = 4096;
+
+    /**
+     * Given JSON-like content, produces a string of JSON that is safe to embed,
+     * safe to pass to JavaScript's {@code eval} operator.
+     *
+     * @param jsonish JSON-like content.
+     * @return embeddable JSON
+     */
+    public static String sanitize(String jsonish) {
+        return sanitize(jsonish, DEFAULT_NESTING_DEPTH);
+    }
+
+    /**
+     * Same as {@link JsonSanitizer#sanitize(String)}, but allows to set a custom
+     * maximum nesting depth.
+     *
+     * @param jsonish JSON-like content.
+     * @param maximumNestingDepth maximum nesting depth.
+     * @return embeddable JSON
+     */
+    public static String sanitize(String jsonish, int maximumNestingDepth) {
+        JsonSanitizer sanitizer = new JsonSanitizer(jsonish, maximumNestingDepth);
+        sanitizer.sanitize();
+        return sanitizer.toString();
+    }
+
+    private enum State {
+        START_ARRAY,
+        BEFORE_ELEMENT,
+        AFTER_ELEMENT,
+        START_MAP,
+        BEFORE_KEY,
+        AFTER_KEY,
+        BEFORE_VALUE,
+        AFTER_VALUE,
+    }
+
+    private final int maximumNestingDepth;
+    private final String jsonish;
+    private int bracketDepth;
+    private boolean[] isMap;
+    private StringBuilder sanitizedJson;
+    private int cleaned;
+
+    private static final boolean LOG_VERBOSE = false;
+
+    private JsonSanitizer(String jsonish, int maximumNestingDepth) {
+        this.maximumNestingDepth =
+                Math.min(Math.max(1, maximumNestingDepth), MAXIMUM_NESTING_DEPTH);
+        this.jsonish = jsonish != null ? jsonish : "null";
+    }
+
+    private void sanitize() {
+        bracketDepth = cleaned = 0;
+        sanitizedJson = null;
+
+        State state = State.START_ARRAY;
+        int length = jsonish.length();
+
+        outerLoop:
+        for (int i = 0; i < length; ++i) {
+            try {
+                char ch = jsonish.charAt(i);
+                if (LOG_VERBOSE) {
+                    String sanitizedSoFar =
+                            (sanitizedJson == null ? "" : sanitizedJson)
+                                    + jsonish.substring(cleaned, i);
+                    LOG.debug("i={}, ch='{}', state={}, sanitized={}", i, ch, state, sanitizedSoFar);
+                }
+                switch (ch) {
+                    case '\t', '\n', '\r', ' ':
+                        break;
+
+                    case '"', '\'':
+                        state = requireValueState(i, state, true);
+                        int strEnd = findEndOfQuotedString(jsonish, i);
+                        sanitizeString(i, strEnd);
+                        i = strEnd - 1;
+                        break;
+
+                    case '(', ')':
+                        elide(i, i + 1);
+                        break;
+
+                    case '{', '[': {
+                        state = requireValueState(i, state, false);
+                        if (isMap == null) {
+                            isMap = new boolean[maximumNestingDepth];
+                        }
+                        boolean map = (ch == '{');
+                        if (bracketDepth >= maximumNestingDepth) {
+                            throw new IllegalStateException("Maximum nesting depth exceeded");
+                        }
+                        isMap[bracketDepth++] = map;
+                        state = map ? State.START_MAP : State.START_ARRAY;
+                        break;
+                    }
+
+                    case '}', ']': {
+                        if (bracketDepth == 0) {
+                            elide(i, length);
+                            break outerLoop;
+                        }
+
+                        switch (state) {
+                            case BEFORE_VALUE:
+                                insert(i, "null");
+                                break;
+                            case BEFORE_ELEMENT, BEFORE_KEY:
+                                elideTrailingComma(i);
+                                break;
+                            case AFTER_KEY:
+                                insert(i, ":null");
+                                break;
+                            case START_MAP, START_ARRAY, AFTER_ELEMENT, AFTER_VALUE:
+                                break;
+                            default:
+                                break;
+                        }
+
+                        --bracketDepth;
+                        char expectedCloseBracket = isMap[bracketDepth] ? '}' : ']';
+                        if (ch != expectedCloseBracket) {
+                            replace(i, i + 1, expectedCloseBracket);
+                        }
+
+                        state = (bracketDepth == 0 || !isMap[bracketDepth - 1]) ? State.AFTER_ELEMENT : State.AFTER_VALUE;
+                        break;
+                    }
+
+                    case ',':
+                        if (bracketDepth == 0) {
+                            throw UNBRACKETED_COMMA;
+                        }
+                        switch (state) {
+                            case AFTER_ELEMENT:
+                                state = State.BEFORE_ELEMENT;
+                                break;
+                            case AFTER_VALUE:
+                                state = State.BEFORE_KEY;
+                                break;
+                            case START_ARRAY, BEFORE_ELEMENT:
+                                insert(i, "null");
+                                state = State.BEFORE_ELEMENT;
+                                break;
+                            case START_MAP, BEFORE_KEY, AFTER_KEY:
+                                elide(i, i + 1);
+                                break;
+                            case BEFORE_VALUE:
+                                insert(i, "null");
+                                state = State.BEFORE_KEY;
+                                break;
+                            default:
+                                break;
+                        }
+                        break;
+
+                    case ':':
+                        if (state == State.AFTER_KEY) {
+                            state = State.BEFORE_VALUE;
+                        } else {
+                            elide(i, i + 1);
+                        }
+                        break;
+
+                    case '/':
+                        int end = i + 1;
+                        if (i + 1 < length) {
+                            char nextChar = jsonish.charAt(i + 1);
+                            if (nextChar == '/') {
+                                end = findLineCommentEnd(i + 2, length);
+                            } else if (nextChar == '*') {
+                                end = findBlockCommentEnd(i + 2, length);
+                            }
+                        }
+                        elide(i, end);
+                        i = end - 1;
+                        break;
+
+                    default:
+                        int runEnd = findRunEnd(i, length);
+                        if (runEnd == i) {
+                            elide(i, i + 1);
+                            break;
+                        }
+
+                        state = requireValueState(i, state, true);
+
+                        boolean isNumber = isNumberToken(jsonish.charAt(i));
+                        boolean isKeyword = !isNumber && isKeyword(i, runEnd);
+
+                        if (state == State.AFTER_KEY) {
+                            insert(i, '"');
+                            if (isNumber) {
+                                canonicalizeNumber(i, runEnd);
+                                insert(runEnd, '"');
+                            } else {
+                                sanitizeString(i, runEnd);
+                            }
+                        } else {
+                            if (isNumber) {
+                                normalizeNumber(i, runEnd);
+                            } else if (!isKeyword) {
+                                insert(i, '"');
+                                sanitizeString(i, runEnd);
+                            }
+                        }
+                        i = runEnd - 1;
+                        break;
+                }
+            } catch (UnbracketedComma ex) {
+                elide(i, length);
+                break;
+            }
+        }
+
+        if (state == State.START_ARRAY && bracketDepth == 0) {
+            insert(length, "null");
+            state = State.AFTER_ELEMENT;
+        }
+
+        if ((sanitizedJson != null && sanitizedJson.length() != 0) || cleaned != 0 || bracketDepth != 0) {
+            if (sanitizedJson == null) {
+                sanitizedJson = new StringBuilder(length + bracketDepth);
+            }
+            sanitizedJson.append(jsonish, cleaned, length);
+            cleaned = length;
+
+            switch (state) {
+                case BEFORE_ELEMENT, BEFORE_KEY:
+                    elideTrailingComma(length);
+                    break;
+                case AFTER_KEY:
+                    sanitizedJson.append(":null");
+                    break;
+                case BEFORE_VALUE:
+                    sanitizedJson.append("null");
+                    break;
+                default:
+                    break;
+            }
+
+            while (bracketDepth != 0) {
+                sanitizedJson.append(isMap[--bracketDepth] ? '}' : ']');
+            }
+        }
+    }
+
+    private void sanitizeString(int start, int end) {
+        boolean closed = false;
+        for (int i = start; i < end; ++i) {
+            char ch = jsonish.charAt(i);
+            switch (ch) {
+                case '\t': replace(i, i + 1, "\\t"); break;
+                case '\n': replace(i, i + 1, "\\n"); break;
+                case '\r': replace(i, i + 1, "\\r"); break;
+                case '\u2028': replace(i, i + 1, "\\u2028"); break;
+                case '\u2029': replace(i, i + 1, "\\u2029"); break;
+                case '"', '\'':
+                    if (i == start) {
+                        if (ch == '\'') { replace(i, i + 1, "\""); }
+                    } else {
+                        if (i + 1 == end) {
+                            char startDelim = jsonish.charAt(start);
+                            if (startDelim != '\'') {
+                                startDelim = '"';
+                            }
+                            closed = startDelim == ch;
+                        }
+                        if (closed) {
+                            if (ch == '\'') { replace(i, i + 1, "\""); }
+                        } else if (ch == '"') {
+                            insert(i, '\\');
+                        }
+                    }
+                    break;
+                case '<': {
+                    if (i + 3 >= end) break;
+                    int la = i + 1;
+                    int c1AndDelta = unescapedChar(jsonish, la);
+                    char c1 = (char) c1AndDelta;
+                    la += c1AndDelta >>> 16;
+
+                    long c2AndDelta = unescapedChar(jsonish, la);
+                    char c2 = (char) c2AndDelta;
+                    la += c2AndDelta >>> 16;
+
+                    long c3AndEnd = unescapedChar(jsonish, la);
+                    char c3 = (char) c3AndEnd;
+
+                    char lc1 = (char) (c1 | 32);
+                    char lc2 = (char) (c2 | 32);
+                    char lc3 = (char) (c3 | 32);
+
+                    if ((c1 == '!' && c2 == '-' && c3 == '-') ||
+                        (lc1 == 's' && lc2 == 'c' && lc3 == 'r') ||
+                        (c1 == '/' && lc2 == 's' && lc3 == 'c')) {
+                        replace(i, i + 1, "\\u003c");
+                    }
+                }
+                break;
+                case '>':
+                    if (i - 2 >= start) {
+                        int lb = i - 1;
+                        if ((runSlashPreceding(jsonish, lb) & 1) == 1) {
+                            lb -= 1;
+                        }
+                        int cm1AndDelta = unescapedCharRev(jsonish, lb);
+                        char cm1 = (char) cm1AndDelta;
+                        if ('-' == cm1) {
+                            lb -= cm1AndDelta >>> 16;
+                            int cm2AndDelta = unescapedCharRev(jsonish, lb);
+                            char cm2 = (char) cm2AndDelta;
+                            if ('-' == cm2) {
+                                replace(i, i + 1, "\\u003e");
+                            }
+                        }
+                    }
+                    break;
+                case ']':
+                    if (i + 2 < end) {
+                        int la = i + 1;
+                        long c1AndDelta = unescapedChar(jsonish, la);
+                        char c1 = (char) c1AndDelta;
+                        la += c1AndDelta >>> 16;
+
+                        long c2AndEnd = unescapedChar(jsonish, la);
+                        char c2 = (char) c2AndEnd;
+
+                        if (']' == c1 && '>' == c2) {
+                            replace(i, i + 1, "\\u005d");
+                        }
+                    }
+                    break;
+                case '\\':
+                    if (i + 1 == end) {
+                        elide(i, i + 1);
+                        break;
+                    }
+                    char nextChar = jsonish.charAt(i + 1);
+                    switch (nextChar) {
+                        case 'b', 'f', 'n', 'r', 't', '\\', '/', '"':
+                            ++i;
+                            break;
+                        case 'v':
+                            replace(i, i + 2, "\\u0008");
+                            ++i;
+                            break;
+                        case 'x':
+                            if (i + 4 < end && isHexAt(i + 2) && isHexAt(i + 3)) {
+                                replace(i, i + 2, "\\u00");
+                                i += 3;
+                            } else {
+                                elide(i, i + 1);
+                            }
+                            break;
+                        case 'u':
+                            if (i + 6 < end && isHexAt(i + 2) && isHexAt(i + 3) && isHexAt(i + 4) && isHexAt(i + 5)) {
+                                i += 5;
+                            } else {
+                                elide(i, i + 1);
+                            }
+                            break;
+                        case '0', '1', '2', '3', '4', '5', '6', '7': {
+                            int octalStart = i + 1;
+                            int octalEnd = octalStart + 1;
+                            if (octalEnd < end && isOctAt(octalEnd)) {
+                                ++octalEnd;
+                                if (jsonish.charAt(octalStart) <= '3' && octalEnd < end && isOctAt(octalEnd)) {
+                                    ++octalEnd;
+                                }
+                            }
+                            int value = 0;
+                            for (int j = octalStart; j < octalEnd; ++j) {
+                                value = (value << 3) | (jsonish.charAt(j) - '0');
+                            }
+                            replace(octalStart, octalEnd, "u00");
+                            appendHex(value, 2);
+                            i = octalEnd - 1;
+                            break;
+                        }
+                        default:
+                            elide(i, i + 1);
+                            break;
+                    }
+                    break;
+                default:
+                    if (!isValidXmlChar(ch)) {
+                        replace(i, i + 1, "\\u");
+                        for (int j = 4; j >= 0; j--) {
+                            sanitizedJson.append(HEX_DIGITS[(ch >>> (j * 4)) & 0xf]);
+                        }
+                    }
+                    break;
+            }
+        }
+        if (!closed) {
+            insert(end, '"');
+        }
+    }
+
+    private static boolean isValidXmlChar(char ch) {
+        return (ch == 0x9 || ch == 0xA || ch == 0xD)
+            || (ch >= 0x20 && ch <= 0xD7FF)
+            || (ch >= 0xE000 && ch <= 0xFFFD);
+    }
+
+    private State requireValueState(int pos, State state, boolean canBeKey) throws UnbracketedComma {
+        switch (state) {
+            case START_MAP:
+            case BEFORE_KEY:
+                if (canBeKey) {
+                    return State.AFTER_KEY;
+                }
+                insert(pos, "\"\":");
+                return State.AFTER_VALUE;
+            case AFTER_KEY:
+                insert(pos, ':');
+                return State.AFTER_VALUE;
+            case BEFORE_VALUE:
+                return State.AFTER_VALUE;
+            case AFTER_VALUE:
+                if (canBeKey) {
+                    insert(pos, ',');
+                    return State.AFTER_KEY;
+                }
+                insert(pos, ",\"\":");
+                return State.AFTER_VALUE;
+            case START_ARRAY:
+            case BEFORE_ELEMENT:
+                return State.AFTER_ELEMENT;
+            case AFTER_ELEMENT:
+                if (bracketDepth == 0) throw UNBRACKETED_COMMA;
+                insert(pos, ',');
+                return State.AFTER_ELEMENT;
+            default:
+                throw new AssertionError();
+        }
+    }
+
+    private void insert(int pos, char ch) {
+        replace(pos, pos, ch);
+    }
+
+    private void insert(int pos, String s) {
+        replace(pos, pos, s);
+    }
+
+    private void elide(int start, int end) {
+        if (sanitizedJson == null) {
+            sanitizedJson = new StringBuilder(jsonish.length() + 16);
+        }
+        sanitizedJson.append(jsonish, cleaned, start);
+        cleaned = end;
+    }
+
+    private void replace(int start, int end, char ch) {
+        elide(start, end);
+        sanitizedJson.append(ch);
+    }
+
+    private void replace(int start, int end, String s) {
+        elide(start, end);
+        sanitizedJson.append(s);
+    }
+
+    private int findEndOfQuotedString(String s, int start) {
+        char quote = s.charAt(start);
+        for (int i = start; (i = s.indexOf(quote, i + 1)) >= 0; ) {
+            int slashCount = 0;
+            int checkIndex = i - 1;
+            while (checkIndex >= start && s.charAt(checkIndex) == '\\') {
+                slashCount++;
+                checkIndex--;
+            }
+            if (slashCount % 2 == 0) {
+                return i + 1;
+            }
+        }
+        return s.length();
+    }
+
+    private void elideTrailingComma(int closeBracketPos) {
+        for (int i = closeBracketPos - 1; i >= cleaned; --i) {
+            char ch = jsonish.charAt(i);
+            if (Character.isWhitespace(ch)) continue;
+            if (ch == ',') {
+                elide(i, i + 1);
+                return;
+            }
+            break;
+        }
+        if (sanitizedJson != null) {
+            for (int i = sanitizedJson.length() - 1; i >= 0; --i) {
+                char ch = sanitizedJson.charAt(i);
+                if (Character.isWhitespace(ch)) continue;
+                if (ch == ',') {
+                    sanitizedJson.deleteCharAt(i);
+                    return;
+                }
+                break;
+            }
+        }
+        throw new AssertionError("Trailing comma not found in jsonish or sanitizedJson");
+    }
+
+    private int findLineCommentEnd(int start, int length) {
+        for (int i = start; i < length; ++i) {
+            char ch = jsonish.charAt(i);
+            if (ch == '\n' || ch == '\r' || ch == '\u2028' || ch == '\u2029') {
+                return i + 1;
+            }
+        }
+        return length;
+    }
+
+    private int findBlockCommentEnd(int start, int length) {
+        for (int i = start; i + 1 < length; ++i) {
+            if (jsonish.charAt(i) == '*' && jsonish.charAt(i + 1) == '/') {
+                return i + 2;
+            }
+        }
+        return length;
+    }
+
+    private int findRunEnd(int start, int length) {
+        int i = start;
+        while (i < length) {
+            char ch = jsonish.charAt(i);
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '+' || ch == '-' || ch == '.' || (ch >= 'A' && ch <= 'Z') || ch == '_' || ch == '`')) {
+                break;
+            }
+            i++;
+        }
+        return i;
+    }
+
+    private boolean isKeyword(int start, int end) {
+        int n = end - start;
+        if (n == 5) {
+            return "false".regionMatches(0, jsonish, start, n);
+        } else if (n == 4) {
+            return "null".regionMatches(0, jsonish, start, n)
+                    || "true".regionMatches(0, jsonish, start, n);
+        }
+        return false;
+    }
+
+    private boolean isNumberToken(char ch) {
+        return (ch >= '0' && ch <= '9') || ch == '.' || ch == '+' || ch == '-';
+    }
+
+    private boolean isOctAt(int i) {
+        return isOct(jsonish.charAt(i));
+    }
+
+    private static boolean isOct(char ch) {
+        return ch >= '0' && ch <= '7';
+    }
+
+    private boolean isHexAt(int i) {
+        return isHex(jsonish.charAt(i));
+    }
+
+    private static boolean isHex(char ch) {
+        if (ch >= '0' && ch <= '9') return true;
+        int lowCh = ch | 0x20;
+        return lowCh >= 'a' && lowCh <= 'f';
+    }
+
+    private static final char[] HEX_DIGITS = {
+            '0', '1', '2', '3', '4', '5', '6', '7',
+            '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'
+    };
+
+    private void appendHex(int value, int digits) {
+        for (int i = digits - 1; i >= 0; --i) {
+            int shift = i * 4;
+            int digit = (value >>> shift) & 0xF;
+            sanitizedJson.append(HEX_DIGITS[digit]);
+        }
+    }
+
+    private static final UnbracketedComma UNBRACKETED_COMMA = new UnbracketedComma();
+
+    private static final class UnbracketedComma extends Exception {
+        private static final long serialVersionUID = 1L;
+        UnbracketedComma() {
+            super(null, null, false, false);
+        }
+    }
+
+    private static int runSlashPreceding(String jsonish, int pos) {
+        int startRun = pos;
+        while (startRun >= 0 && jsonish.charAt(startRun) == '\\') {
+            --startRun;
+        }
+        return pos - startRun;
+    }
+
+    private static int unescapedChar(String s, int pos) {
+        int n = s.length();
+        if (pos >= n) {
+            return 0;
+        }
+        char c = s.charAt(pos);
+        if (c == '\\') {
+            if (pos + 1 == n) {
+                return 0x10000;
+            }
+            char next = s.charAt(pos + 1);
+            switch (next) {
+                case '0', '1', '2', '3', '4', '5', '6', '7': {
+                    int octStart = pos + 1;
+                    int octEnd = octStart + 1;
+                    if (octEnd < n && isOct(s.charAt(octEnd))) {
+                        ++octEnd;
+                        if (next <= '3' && octEnd < n && isOct(s.charAt(octEnd))) {
+                            ++octEnd;
+                        }
+                    }
+                    int value = 0;
+                    for (int i = octStart; i < octEnd; ++i) {
+                        value = (value << 3) | (s.charAt(i) - '0');
+                    }
+                    return ((octEnd - pos) << 16) | value;
+                }
+                case 'x':
+                    if (pos + 3 < n && isHex(s.charAt(pos + 2)) && isHex(s.charAt(pos + 3))) {
+                        return 0x40000 | (hexVal(s.charAt(pos + 2)) << 4) | hexVal(s.charAt(pos + 3));
+                    }
+                    break;
+                case 'u':
+                    if (pos + 5 < n && isHex(s.charAt(pos + 2)) && isHex(s.charAt(pos + 3))
+                        && isHex(s.charAt(pos + 4)) && isHex(s.charAt(pos + 5))) {
+                        return 0x60000 | (hexVal(s.charAt(pos + 2)) << 12)
+                            | (hexVal(s.charAt(pos + 3)) << 8)
+                            | (hexVal(s.charAt(pos + 4)) << 4)
+                            | hexVal(s.charAt(pos + 5));
+                    }
+                    break;
+                case 'b': return (0x20000 | '\b');
+                case 'f': return (0x20000 | '\f');
+                case 'n': return 0x2000A;
+                case 'r': return 0x2000D;
+                case 't': return 0x20009;
+                case 'v': return 0x20008;
+                default: return (0x20000) | next;
+            }
+        } else {
+            return 0x10000 | c;
+        }
+        return 0;
+    }
+
+    private static int unescapedCharRev(String s, int rightIncl) {
+        if (rightIncl < 0) return 0;
+        for (int i = 1; i < 6; ++i) {
+            int left = rightIncl - i;
+            if (left < 0) break;
+            if (s.charAt(left) == '\\') {
+                int n = 1;
+                while (left - n >= 0 && s.charAt(left - n) == '\\') {
+                    ++n;
+                }
+                if ((n & 1) == 1) {
+                    int unescaped = unescapedChar(s, left);
+                    if (((unescaped >>> 16) - 1) == i) {
+                        return unescaped;
+                    }
+                }
+                break;
+            }
+        }
+        return 0x10000 | s.charAt(rightIncl);
+    }
+
+    @Override
+    public String toString() {
+        return sanitizedJson != null ? sanitizedJson.toString() : jsonish;
+    }
+}
+
